@@ -35,6 +35,8 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
+netbox.yml
+
 # Unit test / coverage reports
 htmlcov/
 .tox/
