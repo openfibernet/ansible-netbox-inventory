@@ -231,14 +231,13 @@ class NetboxInventory:
             self.result["all"]["hosts"].append(host.name)
 
             # Create hostgroups by cluster, role
-            self.create_group_entry(host.cluster.name, host.name)
-            self.create_group_entry(host.role.slug, host.name)
+            if host.cluster is not None:
+                self.create_group_entry(host.cluster.name, host.name)
+            if host.role is not None:
+                self.create_group_entry(host.role.slug, host.name)
 
             if not host in self.result["_meta"]["hostvars"]:
                 self.result["_meta"]["hostvars"][host.name] = {}
-
-            if host.custom_fields['vm-attributes'] != None:
-                self.result["_meta"]["hostvars"][host.name]['attributes'] = json.loads(host.custom_fields['vm-attributes'])
 
             if host.primary_ip != None:
                 self.result["_meta"]["hostvars"][host.name]['ansible_ssh_host'] = str(IPNetwork(host.primary_ip.address).ip)
