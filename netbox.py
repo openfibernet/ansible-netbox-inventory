@@ -6,18 +6,19 @@ import os, yaml, json, sys, argparse, logging, re, datetime
 try:
     import pynetbox
     from netaddr import *
-except ImportError, e:
+except ImportError as e:
     sys.exit("Please install required python modules: pynetbox netaddr")
 
-class NetboxInventory:
+class NetboxInventory(dict):
     def __init__(self):
+        super(NetboxInventory, self).__init__()
         self.config = self.load_config()
 
-        if self.config['debug']:
+        if self.config.get('debug', False):
             logging.basicConfig(filename='netbox_inventory.log', level=logging.DEBUG)
 
         self.netbox = self.connect_netbox(self.config['url'], self.config['token'])
-        self.result = {
+        self.update({
             "all": {
                 "hosts": []
             },
@@ -30,7 +31,7 @@ class NetboxInventory:
                     "vlans": {}
                 }
             }
-        }
+        })
 
     def load_config(self):
         with open(os.path.join(os.path.dirname(__file__), "netbox.yml"), 'r') as stream:
@@ -50,12 +51,16 @@ class NetboxInventory:
     def lookup_ip_for_interfaces(self, interfaces, device):
         ips = self.netbox.ipam.ip_addresses.filter(device=device)
         for ip in ips:
+            if (str(ip.address) == str(device.primary_ip4) or (str(ip.address) == str(device.primary_ip6))):
+                ip.isPrimary = True
+            else:
+                ip.isPrimary = False
             if ip.family == 4:
                 interfaces[ip.interface.name]['v4_address'].append(str(ip.address))
-                self.create_dns_records_v4(ip.interface.name, device, str(ip.address))
+                self.create_dns_records_v4(ip.interface.name, device, ip)
             elif ip.family == 6:
                 interfaces[ip.interface.name]['v6_address'].append(str(ip.address))
-                self.create_dns_records_v6(ip.interface.name, device, str(ip.address))
+                self.create_dns_records_v6(ip.interface.name, device, ip)
 
         return interfaces
 
@@ -71,32 +76,64 @@ class NetboxInventory:
         }
 
     def create_dns_records_v4(self, interface, device, ip):
+        try:
+            ipIsPrimary = ip.isPrimary
+        except:
+            ipIsPrimary = False
+        ip = str(ip.address)
         ip = str(IPNetwork(ip).ip)
         pre = ip.split(".")
         record_name = pre.pop()
         domain = ".".join(pre[::-1] + ['in-addr', 'arpa'])
         intf = self.sanitize_dns_name(interface)
 
-        self.result['ungrouped']['vars']['dns_entries'].append(
-            self.create_dns_record(domain, record_name, "PTR", ".".join([intf, device.name, self.config['dns_name']]))
-        )
-        self.result['ungrouped']['vars']['dns_entries'].append(
-            self.create_dns_record(self.config['dns_name'], ".".join([intf, device.name, self.config['dns_name']]), "A", ip)
-        )
+        if (ipIsPrimary == True):
+            self['ungrouped']['vars']['dns_entries'].append(
+                self.create_dns_record(domain, IPAddress(ip).reverse_dns, "PTR", ".".join([device.name, self.config['dns_name']]))
+            )
+            self['ungrouped']['vars']['dns_entries'].append(
+                self.create_dns_record(self.config['dns_name'], ".".join([device.name, self.config['dns_name']]), "A", ip)
+            )
+            self['ungrouped']['vars']['dns_entries'].append(
+                self.create_dns_record(self.config['dns_name'], ".".join([intf, device.name, self.config['dns_name']]), "A", ip)
+            )
+        else:
+            self['ungrouped']['vars']['dns_entries'].append(
+                self.create_dns_record(domain, IPAddress(ip).reverse_dns, "PTR", ".".join([intf, device.name, self.config['dns_name']]))
+            )
+            self['ungrouped']['vars']['dns_entries'].append(
+                self.create_dns_record(self.config['dns_name'], ".".join([intf, device.name, self.config['dns_name']]), "A", ip)
+            )
 
     def create_dns_records_v6(self, interface, device, ip):
+        try:
+            ipIsPrimary = ip.isPrimary
+        except:
+            ipIsPrimary = False
+        ip = str(ip.address)
         ip = str(IPNetwork(ip).ip)
         pre = ip.split(".")
         record_name = pre.pop()
-        domain = ".".join(pre[::-1] + ['in-addr', 'arpa'])
+        domain = ".".join(pre[::-1] + ['ip6', 'arpa'])
         intf = self.sanitize_dns_name(interface)
 
-        self.result['ungrouped']['vars']['dns_entries'].append(
-            self.create_dns_record(self.config['dns_name'], ".".join([intf, device.name, self.config['dns_name']]), "AAAA", ip)
-        )
-        self.result['ungrouped']['vars']['dns_entries'].append(
-            self.create_dns_record(self.config['ipv6_ptr_domain'], IPAddress(ip).reverse_dns, "PTR", ".".join([intf, device.name, self.config['dns_name']]))
-        )
+        if (ipIsPrimary == True):
+            self['ungrouped']['vars']['dns_entries'].append(
+                self.create_dns_record(domain, IPAddress(ip).reverse_dns, "PTR", ".".join([device.name, self.config['dns_name']]))
+            )
+            self['ungrouped']['vars']['dns_entries'].append(
+                self.create_dns_record(self.config['dns_name'], ".".join([device.name, self.config['dns_name']]), "AAAA", ip)
+            )
+            self['ungrouped']['vars']['dns_entries'].append(
+                self.create_dns_record(self.config['dns_name'], ".".join([intf, device.name, self.config['dns_name']]), "AAAA", ip)
+            )
+        else:
+            self['ungrouped']['vars']['dns_entries'].append(
+                self.create_dns_record(domain, IPAddress(ip).reverse_dns, "PTR", ".".join([intf, device.name, self.config['dns_name']]))
+            )
+            self['ungrouped']['vars']['dns_entries'].append(
+                self.create_dns_record(self.config['dns_name'], ".".join([intf, device.name, self.config['dns_name']]), "AAAA", ip)
+            )
 
     def lookup_circuits(self, circuit_id, interface_id, mtu_size, interface_mode, vlans = {}):
         circuit = self.netbox.circuits.circuits.get(circuit_id)
@@ -129,11 +166,10 @@ class NetboxInventory:
         return slug if len(slug) <= 32 else slug[0:32]
 
     def save_vlan_global(self, vlan_id, vlan_name):
-        if vlan_id not in self.result['ungrouped']['vars']['vlans']:
-            self.result['ungrouped']['vars']['vlans'][vlan_id] = {
-                "name": vlan_name,
-                "slug": self.create_slug(vlan_name)
-            }
+        self['ungrouped']['vars']['vlans'].setdefault(vlan_id, {
+            "name": vlan_name,
+            "slug": self.create_slug(vlan_name)
+        })
 
     def return_vlans(self, interface):
         r = []
@@ -165,36 +201,33 @@ class NetboxInventory:
     def return_interface(self, description, int_type, id, mtu='', interface_mode='Untagged', vlans=[]):
         intf = { 'description': description, 'type': int_type, 'id': id, 'interface_mode': interface_mode, 'vlans': vlans, 'v4_address': [], 'v6_address': [] }
 
-        if mtu != None:
+        if mtu is not None:
             intf['mtu'] = mtu
 
         return intf
 
     def create_group_entry(self, group, hostname):
-        if group not in self.result:
-            self.result[group] = {}
-            self.result[group]["hosts"] = []
-
-        self.result[group]["hosts"].append(hostname)
+        gdict = self.setdefault(group, {})
+        hosts = gdict.setdefault('hosts', [])
+        hosts.append(hostname)
 
     def fetch_netbox_devices(self):
         for host in self.netbox.dcim.devices.filter(status=1):
-            if host.name == None:
+            if host.name is None:
                 continue
 
             h = host.name
-            self.result["all"]["hosts"].append(h)
+            self["all"]["hosts"].append(h)
 
             # Create hostgroups by device_role, device_type and site
             self.create_group_entry(host.device_role.slug, h)
             self.create_group_entry(host.device_type.slug, h)
             self.create_group_entry(host.site.slug, h)
 
-            if not host in self.result["_meta"]["hostvars"]:
-                self.result["_meta"]["hostvars"][h] = { "interfaces": {}}
+            hvar = self["_meta"]["hostvars"].setdefault(h, { "interfaces": {}})
 
-            if host.virtual_chassis != None:
-                self.result["_meta"]["hostvars"][h]['virtual_chassis'] = []
+            if host.virtual_chassis is not None:
+                hvar['virtual_chassis'] = []
                 vc_members = self.netbox.dcim.devices.filter(virtual_chassis_id=host.virtual_chassis.id)
                 for vcm in vc_members:
                     if vcm.vc_position == 0 or vcm.vc_position == 1:
@@ -202,33 +235,34 @@ class NetboxInventory:
                     else:
                         role = 'line-card'
 
-                    self.result["_meta"]["hostvars"][h]['virtual_chassis'].append({ 'serial': vcm.serial, 'role': role, 'device_name': vcm.name, 'vc_position': vcm.vc_position })
+                    hvar['virtual_chassis'].append({ 'serial': vcm.serial, 'role': role, 'device_name': vcm.name, 'vc_position': vcm.vc_position })
 
-            if host.custom_fields != None:
-                for k,v in host.custom_fields.items():
-                    self.result["_meta"]["hostvars"][h][k] = v
-
-            self.result["_meta"]["hostvars"][h]['site'] = host.site.slug
-            self.result["_meta"]["hostvars"][h]['serial'] = host.serial
-            self.result["_meta"]["hostvars"][h]['siteid'] = host.site.id
-            self.result["_meta"]["hostvars"][h]['model'] = host.device_type.slug
-            self.result["_meta"]["hostvars"][h]['manufacturer'] = host.device_type.manufacturer.slug
+            hvar.update(host.custom_fields or {})
+            hvar.update({
+                'site':         host.site.slug,
+                'serial':       host.serial,
+                'siteid':       host.site.id,
+                'model':        host.device_type.slug,
+                'manufacturer': host.device_type.manufacturer.slug,
+            })
 
             # Lookup site details
             site = self.netbox.dcim.sites.filter(slug=host.site.slug)
             if len(site) > 0:
-                self.result["_meta"]["hostvars"][h]['latitude'] = site[0].latitude
-                self.result["_meta"]["hostvars"][h]['longitude'] = site[0].longitude
+                hvar.update({
+                    'latitude': site[0].latitude,
+                    'longitude': site[0].longitude,
+                })
 
-            self.result["_meta"]["hostvars"][h]["interfaces"] = self.get_interfaces(host)
+            hvar["interfaces"] = self.get_interfaces(host)
             if host.primary_ip != None:
-                self.result["_meta"]["hostvars"][h]['ansible_ssh_host'] = str(host.primary_ip.address.ip)
+                hvar['ansible_ssh_host'] = str(host.primary_ip.address.ip)
 
-        return self.result
+        return self
 
     def fetch_virtual_machines(self):
         for host in self.netbox.virtualization.virtual_machines.filter(status=1):
-            self.result["all"]["hosts"].append(host.name)
+            self["all"]["hosts"].append(host.name)
 
             # Create hostgroups by cluster, role
             if host.cluster is not None:
@@ -236,13 +270,22 @@ class NetboxInventory:
             if host.role is not None:
                 self.create_group_entry(host.role.slug, host.name)
 
-            if not host in self.result["_meta"]["hostvars"]:
-                self.result["_meta"]["hostvars"][host.name] = {}
-
+            hvar = self["_meta"]["hostvars"].setdefault(host.name, {})
             if host.primary_ip != None:
-                self.result["_meta"]["hostvars"][host.name]['ansible_ssh_host'] = str(IPNetwork(host.primary_ip.address).ip)
+                hvar['ansible_ssh_host'] = str(IPNetwork(host.primary_ip.address).ip)
 
-        return self.result
+        return self
+
+    def fetch_prefixes(self):
+        prefixes = self['ungrouped']['vars'].setdefault('prefixes', {})
+
+        for prefix in self.netbox.ipam.prefixes.filter(status=1):
+            prefixes[str(prefix)] = {
+                'vlan': prefix.vlan.vid,
+            }
+            prefixes[str(prefix)].update(prefix.custom_fields)
+
+        return self
 
 class OFNetboxInventory(NetboxInventory):
     def __init__(self):
@@ -308,9 +351,10 @@ def modification_date(filename):
 def cache_inventory(cache_file):
     n = NetboxInventory()
     n.fetch_virtual_machines()
-    hosts = n.fetch_netbox_devices()
+    n.fetch_netbox_devices()
+    n.fetch_prefixes()
 
-    cache = json.dumps(hosts, sort_keys=True, indent=3)
+    cache = json.dumps(n, sort_keys=True, indent=3)
     with open(cache_file, 'w') as f:
         f.write(cache)
 
